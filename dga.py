@@ -12,7 +12,6 @@ import stealth_requests
 import shutil
 import math
 import random
-import subprocess
 from urllib.parse import urlparse, unquote
 from pathlib import Path
 from dataclasses import dataclass
@@ -20,6 +19,15 @@ from typing import Optional, Tuple
 import logging
 
 logger = logging.getLogger("dga")
+
+DEFAULT_UPLOAD_LIMIT = 25 * 1024 * 1024
+OVERSIZE_FACTOR = 1.5
+GIF_CONVERT_FPS = 24
+GIF_CONVERT_MAX_WIDTH = 800
+GIF_COMPRESS_FPS = 15
+MAX_SEARCH_RESULTS = 5
+DOWNLOAD_TIMEOUT = 30.0
+OEMBED_TIMEOUT = 10
 
 
 def setup_logging():
@@ -81,6 +89,69 @@ class DependencyValidator:
             sys.exit(1)
 
 
+class InputValidator:
+    MAX_LINK_LENGTH = 2048
+    MAX_QUERY_LENGTH = 100
+    ALLOWED_SCHEMES = {'http', 'https'}
+    ALLOWED_IMAGE_EXTENSIONS = {
+        '.gif', '.png', '.jpg', '.jpeg', '.webp',
+        '.mp4', '.webm', '.mov', '.avif', '.apng',
+    }
+
+    @staticmethod
+    def validate_link(link: str) -> str:
+        link = link.strip()
+        if not link:
+            raise ValueError("Link cannot be empty.")
+        if len(link) > InputValidator.MAX_LINK_LENGTH:
+            raise ValueError("Link is too long (max 2048 characters).")
+
+        parsed = urlparse(link)
+        if parsed.scheme.lower() not in InputValidator.ALLOWED_SCHEMES:
+            raise ValueError(f"Invalid URL scheme `{parsed.scheme or '(none)'}`. Only HTTP and HTTPS links are allowed.")
+        if not parsed.netloc:
+            raise ValueError("Invalid URL: missing domain.")
+
+        return link
+
+    @staticmethod
+    def validate_image(image: discord.Attachment) -> None:
+        if not image.filename or '.' not in image.filename:
+            raise ValueError("Uploaded file has no recognizable extension.")
+
+        ext = f".{image.filename.rsplit('.', 1)[-1].lower()}"
+        if ext not in InputValidator.ALLOWED_IMAGE_EXTENSIONS:
+            raise ValueError(
+                f"Unsupported file type `{ext}`. Allowed: "
+                f"{', '.join(sorted(InputValidator.ALLOWED_IMAGE_EXTENSIONS))}"
+            )
+
+    @staticmethod
+    def validate_name(name: str) -> str:
+        """Sanitize a GIF name into a clean filename (e.g. 'why-is-he-lying-481.gif')."""
+        name = name.strip()
+        if not name:
+            raise ValueError("Name cannot be empty.")
+        if len(name) > 200:
+            raise ValueError("Name is too long (max 200 characters).")
+
+        sanitized = re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')
+        if not sanitized:
+            raise ValueError("Name must contain at least one letter or number.")
+
+        rand_suffix = random.randint(1, 1000)
+        return f"{sanitized}-{rand_suffix}.gif"
+
+    @staticmethod
+    def validate_query(query: str) -> str:
+        query = query.strip()
+        if not query:
+            raise ValueError("Search query cannot be empty.")
+        if len(query) > InputValidator.MAX_QUERY_LENGTH:
+            raise ValueError(f"Search query is too long (max {InputValidator.MAX_QUERY_LENGTH} characters).")
+        return query
+
+
 class MediaProcessor:
     MEDIA_TYPES = {
         'image/gif': '.gif', 'video/mp4': '.mp4', 'image/png': '.png',
@@ -135,7 +206,7 @@ class MediaProcessor:
             colors = 256 if ratio > 0.4 else 128 if ratio > 0.2 else 64
 
             stream = ffmpeg.input(str(input_path))
-            v = stream.video.filter('fps', fps=15).filter('scale', w=f'trunc(iw*{scale_factor})', h='-1')
+            v = stream.video.filter('fps', fps=GIF_COMPRESS_FPS).filter('scale', w=f'trunc(iw*{scale_factor})', h='-1')
             split = v.split()
 
             palette = split[0].filter('palettegen', max_colors=colors)
@@ -168,7 +239,7 @@ class MediaProcessor:
             try:
                 if is_video:
                     stream = ffmpeg.input(str(input_path))
-                    v = stream.video.filter('fps', fps=24).filter('scale', w='min(iw,800)', h='-1')
+                    v = stream.video.filter('fps', fps=GIF_CONVERT_FPS).filter('scale', w=f'min(iw,{GIF_CONVERT_MAX_WIDTH})', h='-1')
                     split = v.split()
                     palette = split[0].filter('palettegen')
                     out = ffmpeg.filter([split[1], palette], 'paletteuse')
@@ -217,45 +288,25 @@ class MediaProcessor:
 class URLResolver:
     @staticmethod
     async def _get_giphy_title(gif_id: str) -> str:
-        """Fetch the title from Giphy's oembed API using curl (mirrors gettitle.py)."""
-        # Sanitize: gif_id must be alphanumeric only
         if not re.match(r'^[a-zA-Z0-9]+$', gif_id):
             return "untitled"
 
-        direct_gif_url = f"https://i.giphy.com/{gif_id}.gif"
-
-        # Check if the .gif file exists before running curl
-        try:
-            def _check_exists():
-                resp = stealth_requests.get(direct_gif_url, timeout=10)
-                return resp.status_code == 200
-
-            exists = await asyncio.to_thread(_check_exists)
-            if not exists:
-                return "untitled"
-        except Exception:
-            return "untitled"
-
-        # Sanitized oembed URL (gif_id already validated as alphanumeric)
         oembed_url = f"https://giphy.com/services/oembed/?url=https://giphy.com/gifs/{gif_id}"
 
         try:
-            result = await asyncio.to_thread(
-                subprocess.run,
-                ['curl', '-s', '--max-time', '10', oembed_url],
-                capture_output=True, text=True
-            )
+            def _fetch_oembed():
+                resp = stealth_requests.get(oembed_url, timeout=OEMBED_TIMEOUT)
+                resp.raise_for_status()
+                return resp.json()
 
-            if result.returncode == 0 and result.stdout.strip():
-                data = json.loads(result.stdout)
-                raw_title = data.get("title", "Untitled")
+            data = await asyncio.to_thread(_fetch_oembed)
+            raw_title = data.get("title", "Untitled")
 
-                # Clean up the title by removing the default suffix and the word "GIF"
-                clean_title = raw_title.split('-')[0].strip()
-                if clean_title.upper().endswith(" GIF"):
-                    clean_title = clean_title[:-4].strip()
+            clean_title = raw_title.split('-')[0].strip()
+            if clean_title.upper().endswith(" GIF"):
+                clean_title = clean_title[:-4].strip()
 
-                return clean_title if clean_title else "untitled"
+            return clean_title if clean_title else "untitled"
         except Exception:
             pass
 
@@ -263,7 +314,6 @@ class URLResolver:
 
     @staticmethod
     def _make_giphy_filename(title: str) -> str:
-        """Convert title to lowercase-dash-joined filename with random suffix."""
         sanitized = re.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')
         if not sanitized:
             sanitized = "untitled"
@@ -272,8 +322,7 @@ class URLResolver:
 
     @staticmethod
     async def resolve(url: str) -> Tuple[str, Optional[str]]:
-        if hasattr(html, 'unescape'):
-            url = html.unescape(url)
+        url = html.unescape(url)
 
         parsed = urlparse(url)
         domain = parsed.netloc.lower()
@@ -310,7 +359,7 @@ class URLResolver:
                     try:
                         decoded = unquote(encoded_url)
                         if decoded.startswith('http'): return decoded, None
-                    except: pass
+                    except Exception: pass
 
         return url, None
 
@@ -321,15 +370,23 @@ class ArchiverBot(commands.Bot):
         self.app_config = config
         self.temp_dir = Path("temp_archive")
         self.temp_dir.mkdir(exist_ok=True)
+        self.archive_index: list[dict] = []
+        self._index_lock = asyncio.Lock()
+        self.index_ready = asyncio.Event()
+        self._initial_scan_done = False
 
     async def setup_hook(self):
+        await self.add_cog(ArchiveCog(self))
         await self.tree.sync()
         logger.info("Slash commands synced.")
 
     async def on_ready(self):
         logger.info(f"Archiver Bot Online! Logged in as {self.user}")
 
-        # Verbose startup scan of the archive channel
+        if self._initial_scan_done:
+            logger.info("Reconnected — skipping archive re-scan (index preserved).")
+            return
+
         try:
             channel = await self.fetch_target_channel()
             logger.info(f"Archive channel: #{channel.name} (ID: {channel.id})")
@@ -338,17 +395,29 @@ class ArchiverBot(commands.Bot):
             message_count = 0
             attachment_count = 0
             total_size = 0
+            index_entries: list[dict] = []
 
             async for msg in channel.history(limit=None):
                 message_count += 1
                 for att in msg.attachments:
                     attachment_count += 1
                     total_size += att.size
+                    index_entries.append({
+                        "message_id": msg.id,
+                        "filename": att.filename,
+                        "size": att.size,
+                    })
+
+            async with self._index_lock:
+                self.archive_index = index_entries
 
             logger.info(f"Scan complete: {attachment_count} attachments across {message_count} messages")
             logger.info(f"Total archive size: {total_size / (1024 * 1024):.1f} MB")
         except Exception as e:
             logger.warning(f"Startup scan failed (non-fatal): {e}")
+        finally:
+            self._initial_scan_done = True
+            self.index_ready.set()
 
     async def fetch_target_channel(self) -> discord.abc.Messageable:
         channel = self.get_channel(self.app_config.target_channel_id)
@@ -362,16 +431,16 @@ class ArchiverBot(commands.Bot):
             raise ValueError("Invalid URL provided.")
 
         def _download_file():
-            return stealth_requests.get(resolved_url, timeout=30.0)
+            return stealth_requests.get(resolved_url, timeout=DOWNLOAD_TIMEOUT)
 
         resp = await asyncio.to_thread(_download_file)
         if resp.status_code != 200:
             raise ValueError(f"Failed to download file. HTTP {resp.status_code}")
 
-        if len(resp.content) > max_size * 1.5:
+        if len(resp.content) > max_size * OVERSIZE_FACTOR:
             raise ValueError(
                 f"**Download Rejected:** The source file ({len(resp.content) / (1024 * 1024):.1f} MB) "
-                f"is too large. It exceeds 150% of the server's upload limit ({max_size / (1024 * 1024):.1f} MB)."
+                f"is too large. It exceeds {OVERSIZE_FACTOR:.0f}x the server's upload limit ({max_size / (1024 * 1024):.1f} MB)."
             )
 
         content_type = resp.headers.get('Content-Type', '').split(';')[0].strip().lower()
@@ -384,10 +453,10 @@ class ArchiverBot(commands.Bot):
         return temp_file, ext, suggested_name
 
     async def save_attachment(self, attachment: discord.Attachment, interaction_id: int, max_size: int) -> Path:
-        if attachment.size > max_size * 1.5:
+        if attachment.size > max_size * OVERSIZE_FACTOR:
             raise ValueError(
                 f"**Upload Rejected:** The provided image ({attachment.size / (1024 * 1024):.1f} MB) "
-                f"is too large. It exceeds 150% of the server's upload limit ({max_size / (1024 * 1024):.1f} MB)."
+                f"is too large. It exceeds {OVERSIZE_FACTOR:.0f}x the server's upload limit ({max_size / (1024 * 1024):.1f} MB)."
             )
 
         ext = f".{attachment.filename.split('.')[-1].lower()}" if '.' in attachment.filename else '.bin'
@@ -396,21 +465,20 @@ class ArchiverBot(commands.Bot):
         return temp_file
 
 
-def initialize_app():
-    parser = argparse.ArgumentParser(description="Discord Archive Bot")
-    parser.add_argument("--config", required=True, help="Path to the configuration JSON file")
-    args = parser.parse_args()
+class ArchiveCog(commands.Cog):
 
-    DependencyValidator.verify_system_requirements()
-    config = AppConfig.load_from_file(args.config)
+    def __init__(self, bot: ArchiverBot):
+        self.bot = bot
 
-    bot = ArchiverBot(config)
-    
-    @bot.tree.command(name="archive", description="Download, convert, and archive a GIF or image to your private server.")
-    @app_commands.describe(link="The Tenor, Giphy, or Discord CDN link to archive", image="Upload an image to convert and archive")
+    @app_commands.command(name="archive", description="Download, convert, and archive a GIF or image to your private server.")
+    @app_commands.describe(
+        name="A short name for this GIF (e.g. 'why is he lying')",
+        link="The Tenor, Giphy, or Discord CDN link to archive",
+        image="Upload an image to convert and archive",
+    )
     @app_commands.allowed_installs(guilds=True, users=True)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-    async def archive_command(interaction: discord.Interaction, link: str = None, image: discord.Attachment = None):
+    async def archive_command(self, interaction: discord.Interaction, name: str, link: str = None, image: discord.Attachment = None):
         await interaction.response.defer(ephemeral=True)
 
         async def safe_reply(content: str):
@@ -431,24 +499,41 @@ def initialize_app():
             await safe_reply("❌ Please provide exactly **one** option: either a `link` or an `image`.")
             return
 
+        # --- Input validation ---
+        try:
+            upload_filename = InputValidator.validate_name(name)
+            if link:
+                link = InputValidator.validate_link(link)
+            if image:
+                InputValidator.validate_image(image)
+        except ValueError as e:
+            await safe_reply(f"❌ {e}")
+            return
+
         temp_file: Optional[Path] = None
         final_file: Optional[Path] = None
+        cleanup_paths: list[Path] = []
 
         try:
-            channel = await bot.fetch_target_channel()
-            upload_limit = channel.guild.filesize_limit if hasattr(channel, 'guild') else 25 * 1024 * 1024
+            channel = await self.bot.fetch_target_channel()
+            upload_limit = channel.guild.filesize_limit if hasattr(channel, 'guild') else DEFAULT_UPLOAD_LIMIT
 
             if link:
-                temp_file, _, suggested_name = await bot.download_from_link(link, interaction.id, upload_limit)
+                temp_file, _, _ = await self.bot.download_from_link(link, interaction.id, upload_limit)
             else:
-                temp_file = await bot.save_attachment(image, interaction.id, upload_limit)
-                suggested_name = None
+                temp_file = await self.bot.save_attachment(image, interaction.id, upload_limit)
+
+            cleanup_paths.append(temp_file)
 
             magic_type = MediaProcessor.get_magic_type(temp_file)
             if magic_type != 'unknown' and temp_file.suffix.lower() != f'.{magic_type}':
                 proper_temp_file = temp_file.with_name(f"temp_{interaction.id}.{magic_type}")
-                shutil.move(str(temp_file), str(proper_temp_file))
-                temp_file = proper_temp_file
+                try:
+                    shutil.move(str(temp_file), str(proper_temp_file))
+                    temp_file = proper_temp_file
+                    cleanup_paths.append(proper_temp_file)
+                except OSError as e:
+                    logger.warning(f"Failed to rename temp file: {e}")
 
             try:
                 final_file = await asyncio.to_thread(MediaProcessor.convert_to_gif, temp_file)
@@ -456,16 +541,18 @@ def initialize_app():
                 await safe_reply(f"❌ **Conversion Error:** `{e}`")
                 return
 
+            if final_file != temp_file:
+                cleanup_paths.append(final_file)
+
             file_size = os.path.getsize(final_file)
             if file_size > upload_limit:
-                if file_size <= upload_limit * 1.5:
+                if file_size <= upload_limit * OVERSIZE_FACTOR:
                     compressed_file = await asyncio.to_thread(MediaProcessor.compress_gif, final_file, upload_limit)
-                    
+
                     if compressed_file != final_file:
-                        if final_file != temp_file and final_file.exists():
-                            final_file.unlink()
+                        cleanup_paths.append(compressed_file)
                         final_file = compressed_file
-                        
+
                     file_size = os.path.getsize(final_file)
 
                 if file_size > upload_limit:
@@ -477,11 +564,18 @@ def initialize_app():
 
             try:
                 with open(final_file, 'rb') as f:
-                    upload_filename = suggested_name if suggested_name else final_file.name
                     discord_file = discord.File(f, filename=upload_filename)
                     source_text = f"<{link}>" if link else f"uploaded image (`{image.filename}`)"
                     msg = await channel.send(content=f"Archived from: {source_text}", file=discord_file)
-                    
+
+                async with self.bot._index_lock:
+                    for att in msg.attachments:
+                        self.bot.archive_index.append({
+                            "message_id": msg.id,
+                            "filename": att.filename,
+                            "size": att.size,
+                        })
+
                 await safe_reply(f"✅ **Saved successfully!**\n[Click here to jump to the GIF]({msg.jump_url})")
 
             except discord.errors.HTTPException as e:
@@ -495,60 +589,86 @@ def initialize_app():
 
         except ValueError as ve:
             await safe_reply(f"❌ {str(ve)}")
-            
+
         except Exception as e:
             await safe_reply(f"❌ An unexpected error occurred: `{str(e)}`")
             source_log = link if link else image.filename
             logger.error(f"Error archiving {source_log}: {e}", exc_info=True)
-            
-        finally:
-            if temp_file and temp_file.exists():
-                temp_file.unlink()
-            if final_file and final_file.exists() and final_file != temp_file:
-                final_file.unlink()
 
-    @bot.tree.command(name="search", description="Search your GIF archive by filename.")
+        finally:
+            for p in cleanup_paths:
+                try:
+                    if p.exists():
+                        p.unlink()
+                except OSError:
+                    pass
+
+    @app_commands.command(name="search", description="Search your GIF archive by filename.")
     @app_commands.describe(query="Search term to match against GIF filenames")
     @app_commands.allowed_installs(guilds=True, users=True)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-    async def search_command(interaction: discord.Interaction, query: str):
+    async def search_command(self, interaction: discord.Interaction, query: str):
         await interaction.response.defer(ephemeral=True)
 
-        query = query.strip()
-        if not query:
-            await interaction.followup.send("Please provide a search term.")
+        # --- Input validation ---
+        try:
+            query = InputValidator.validate_query(query)
+        except ValueError as e:
+            await interaction.followup.send(f"❌ {e}")
             return
 
         try:
-            channel = await bot.fetch_target_channel()
+            if not self.bot.index_ready.is_set():
+                await interaction.followup.send("⏳ Archive index is still loading. Please try again shortly.")
+                return
 
-            # Live fetch — guarantees fresh, signed CDN URLs
-            matches = []
             query_lower = query.lower()
             search_terms = query_lower.split()
 
-            async for msg in channel.history(limit=None):
-                for att in msg.attachments:
-                    name_lower = att.filename.lower()
-                    # Relaxed match: every word in the query must appear in the filename
+            async with self.bot._index_lock:
+                matched_entries = []
+                for entry in self.bot.archive_index:
+                    name_lower = entry["filename"].lower()
                     if all(term in name_lower for term in search_terms):
-                        matches.append({
-                            "filename": att.filename,
-                            "url": att.url,
-                            "jump_url": msg.jump_url,
-                            "size": att.size,
-                        })
+                        matched_entries.append(entry)
+                    if len(matched_entries) >= MAX_SEARCH_RESULTS:
+                        break
 
-                if len(matches) >= 5:
-                    break
-
-            if not matches:
-                await interaction.followup.send(
-                    f"No GIFs found matching **{query}**."
-                )
+            if not matched_entries:
+                await interaction.followup.send(f"No GIFs found matching **{query}**.")
                 return
 
-            # Build embeds — one per GIF so they render inline
+            channel = await self.bot.fetch_target_channel()
+            matches = []
+            stale_ids: set[int] = set()
+
+            for entry in matched_entries:
+                try:
+                    msg = await channel.fetch_message(entry["message_id"])
+                    for att in msg.attachments:
+                        if att.filename == entry["filename"]:
+                            matches.append({
+                                "filename": att.filename,
+                                "url": att.url,
+                                "jump_url": msg.jump_url,
+                                "size": att.size,
+                            })
+                            break
+                except discord.NotFound:
+                    stale_ids.add(entry["message_id"])
+                except Exception:
+                    continue
+
+            if stale_ids:
+                async with self.bot._index_lock:
+                    self.bot.archive_index = [
+                        e for e in self.bot.archive_index if e["message_id"] not in stale_ids
+                    ]
+
+            if not matches:
+                await interaction.followup.send(f"No accessible GIFs found matching **{query}**.")
+                return
+
             header = f"Found **{len(matches)}** result{'s' if len(matches) != 1 else ''} for **{query}**:"
             embeds = []
             for i, m in enumerate(matches, 1):
@@ -567,6 +687,16 @@ def initialize_app():
             await interaction.followup.send(f"An error occurred while searching: `{e}`")
             logger.error(f"Search error for query '{query}': {e}", exc_info=True)
 
+
+def initialize_app():
+    parser = argparse.ArgumentParser(description="Discord Archive Bot")
+    parser.add_argument("--config", required=True, help="Path to the configuration JSON file")
+    args = parser.parse_args()
+
+    DependencyValidator.verify_system_requirements()
+    config = AppConfig.load_from_file(args.config)
+
+    bot = ArchiverBot(config)
     return bot, config
 
 
