@@ -128,7 +128,6 @@ class InputValidator:
 
     @staticmethod
     def validate_name(name: str) -> str:
-        """Sanitize a GIF name into a clean filename (e.g. 'why-is-he-lying-481.gif')."""
         name = name.strip()
         if not name:
             raise ValueError("Name cannot be empty.")
@@ -464,74 +463,48 @@ class ArchiverBot(commands.Bot):
         await attachment.save(temp_file)
         return temp_file
 
-
-class ArchiveCog(commands.Cog):
-
-    def __init__(self, bot: ArchiverBot):
-        self.bot = bot
-
-    @app_commands.command(name="archive", description="Download, convert, and archive a GIF or image to your private server.")
-    @app_commands.describe(
-        name="A short name for this GIF (e.g. 'why is he lying')",
-        link="The Tenor, Giphy, or Discord CDN link to archive",
-        image="Upload an image to convert and archive",
-    )
-    @app_commands.allowed_installs(guilds=True, users=True)
-    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-    async def archive_command(self, interaction: discord.Interaction, name: str, link: str = None, image: discord.Attachment = None):
-        await interaction.response.defer(ephemeral=True)
-
-        async def safe_reply(content: str):
-            try:
-                if not interaction.is_expired():
-                    await interaction.followup.send(content)
-                else:
-                    await interaction.user.send(content)
-            except discord.errors.NotFound:
-                try:
-                    await interaction.user.send(content)
-                except discord.errors.Forbidden:
-                    pass
-            except Exception:
-                pass
-
-        if bool(link) == bool(image):
-            await safe_reply("❌ Please provide exactly **one** option: either a `link` or an `image`.")
-            return
-
-        # --- Input validation ---
-        try:
-            upload_filename = InputValidator.validate_name(name)
-            if link:
-                link = InputValidator.validate_link(link)
-            if image:
-                InputValidator.validate_image(image)
-        except ValueError as e:
-            await safe_reply(f"❌ {e}")
-            return
-
+    async def do_archive(
+        self,
+        interaction: discord.Interaction,
+        *,
+        link: Optional[str] = None,
+        image: Optional[discord.Attachment] = None,
+        upload_filename: str,
+        safe_reply,
+    ) -> None:
         temp_file: Optional[Path] = None
         final_file: Optional[Path] = None
         cleanup_paths: list[Path] = []
 
+        def _source_markdown(url: str, attachment: Optional[discord.Attachment]) -> str:
+            if url:
+                try:
+                    domain = urlparse(url).netloc.replace('www.', '') or 'link'
+                except Exception:
+                    domain = 'link'
+                return f'[{domain}]({url})'
+            if attachment:
+                return f'[{attachment.filename}]({attachment.url})'
+            return 'unknown'
+
         try:
-            channel = await self.bot.fetch_target_channel()
+            channel = await self.fetch_target_channel()
             upload_limit = channel.guild.filesize_limit if hasattr(channel, 'guild') else DEFAULT_UPLOAD_LIMIT
 
             if link:
-                temp_file, _, _ = await self.bot.download_from_link(link, interaction.id, upload_limit)
+                temp_file, _, _ = await self.download_from_link(link, interaction.id, upload_limit)
             else:
-                temp_file = await self.bot.save_attachment(image, interaction.id, upload_limit)
+                temp_file = await self.save_attachment(image, interaction.id, upload_limit)
 
             cleanup_paths.append(temp_file)
 
             magic_type = MediaProcessor.get_magic_type(temp_file)
             if magic_type != 'unknown' and temp_file.suffix.lower() != f'.{magic_type}':
-                proper_temp_file = temp_file.with_name(f"temp_{interaction.id}.{magic_type}")
+                proper_temp = temp_file.with_name(f"temp_{interaction.id}.{magic_type}")
                 try:
-                    shutil.move(str(temp_file), str(proper_temp_file))
-                    temp_file = proper_temp_file
-                    cleanup_paths.append(proper_temp_file)
+                    shutil.move(str(temp_file), str(proper_temp))
+                    temp_file = proper_temp
+                    cleanup_paths.append(proper_temp)
                 except OSError as e:
                     logger.warning(f"Failed to rename temp file: {e}")
 
@@ -547,36 +520,43 @@ class ArchiveCog(commands.Cog):
             file_size = os.path.getsize(final_file)
             if file_size > upload_limit:
                 if file_size <= upload_limit * OVERSIZE_FACTOR:
-                    compressed_file = await asyncio.to_thread(MediaProcessor.compress_gif, final_file, upload_limit)
-
-                    if compressed_file != final_file:
-                        cleanup_paths.append(compressed_file)
-                        final_file = compressed_file
-
+                    compressed = await asyncio.to_thread(MediaProcessor.compress_gif, final_file, upload_limit)
+                    if compressed != final_file:
+                        cleanup_paths.append(compressed)
+                        final_file = compressed
                     file_size = os.path.getsize(final_file)
 
                 if file_size > upload_limit:
                     await safe_reply(
-                        f"❌ **Converted File Too Large:** Even after optimization, the GIF ({file_size / (1024 * 1024):.1f} MB) "
-                        f"exceeds the server's {upload_limit / (1024 * 1024):.1f} MB limit."
+                        f"❌ **Converted File Too Large:** Even after optimization, the GIF "
+                        f"({file_size / (1024 * 1024):.1f} MB) exceeds the server's "
+                        f"{upload_limit / (1024 * 1024):.1f} MB limit."
                     )
                     return
 
             try:
                 with open(final_file, 'rb') as f:
                     discord_file = discord.File(f, filename=upload_filename)
-                    source_text = f"<{link}>" if link else f"uploaded image (`{image.filename}`)"
-                    msg = await channel.send(content=f"Archived from: {source_text}", file=discord_file)
+                    source_md = _source_markdown(link, image)
+                    channel_content = f"**{upload_filename}** saved from {source_md}"
+                    msg = await channel.send(content=channel_content, file=discord_file, suppress_embeds=True)
 
-                async with self.bot._index_lock:
+                async with self._index_lock:
+                    archived_url = msg.attachments[0].url if msg.attachments else None
                     for att in msg.attachments:
-                        self.bot.archive_index.append({
+                        self.archive_index.append({
                             "message_id": msg.id,
                             "filename": att.filename,
                             "size": att.size,
                         })
 
-                await safe_reply(f"✅ **Saved successfully!**\n[Click here to jump to the GIF]({msg.jump_url})")
+                embed = discord.Embed(
+                    description=f"**{upload_filename}** saved from {source_md}  ·  [jump]({msg.jump_url})",
+                    color=0x57F287,
+                )
+                if archived_url:
+                    embed.set_image(url=archived_url)
+                await safe_reply(embed=embed)
 
             except discord.errors.HTTPException as e:
                 if e.status == 413 or e.code == 40005:
@@ -591,8 +571,8 @@ class ArchiveCog(commands.Cog):
             await safe_reply(f"❌ {str(ve)}")
 
         except Exception as e:
+            source_log = link if link else (image.filename if image else "unknown")
             await safe_reply(f"❌ An unexpected error occurred: `{str(e)}`")
-            source_log = link if link else image.filename
             logger.error(f"Error archiving {source_log}: {e}", exc_info=True)
 
         finally:
@@ -603,6 +583,187 @@ class ArchiveCog(commands.Cog):
                 except OSError:
                     pass
 
+
+def extract_media_from_message(message: discord.Message) -> Optional[Tuple[str, Optional[str]]]:
+    for att in message.attachments:
+        if '.' in att.filename:
+            ext = f".{att.filename.rsplit('.', 1)[-1].lower()}"
+            if ext in InputValidator.ALLOWED_IMAGE_EXTENSIONS:
+                return att.url, None
+
+    for embed in message.embeds:
+        if embed.url:
+            parsed = urlparse(embed.url)
+            domain = parsed.netloc.lower()
+            if ('tenor.com' in domain and '/view/' in embed.url) or \
+               ('giphy.com' in domain and '/gifs/' in embed.url):
+                return embed.url, None
+        if embed.image and embed.image.url and not embed.image.url.startswith('attachment://'):
+            return embed.image.url, None
+        if embed.video and embed.video.url:
+            return embed.video.url, None
+        if embed.thumbnail and embed.thumbnail.url and not embed.thumbnail.url.startswith('attachment://'):
+            url = embed.thumbnail.url
+            ext = Path(urlparse(url).path).suffix.lower()
+            if ext in InputValidator.ALLOWED_IMAGE_EXTENSIONS:
+                return url, None
+
+    return None
+
+
+class GifNameModal(discord.ui.Modal, title="Archive as GIF"):
+    gif_name = discord.ui.TextInput(
+        label="Name for this GIF",
+        placeholder="e.g. why is he lying",
+        min_length=1,
+        max_length=200,
+        style=discord.TextStyle.short,
+    )
+
+    def __init__(self, bot: 'ArchiverBot', source_url: str):
+        super().__init__()
+        self.bot = bot
+        self.source_url = source_url
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        async def safe_reply(content: str = None, **kwargs):
+            try:
+                if not interaction.is_expired():
+                    await interaction.followup.send(content, ephemeral=True, **kwargs)
+                else:
+                    await interaction.user.send(content, **kwargs)
+            except Exception:
+                pass
+
+        try:
+            upload_filename = InputValidator.validate_name(self.gif_name.value)
+            link = InputValidator.validate_link(self.source_url)
+        except ValueError as e:
+            await safe_reply(f"❌ {e}")
+            return
+
+        await self.bot.do_archive(
+            interaction,
+            link=link,
+            upload_filename=upload_filename,
+            safe_reply=safe_reply,
+        )
+
+
+class ArchiveCog(commands.Cog):
+
+    def __init__(self, bot: ArchiverBot):
+        self.bot = bot
+        self._ctx_menu = app_commands.ContextMenu(
+            name="Archive as GIF",
+            callback=self._archive_message_ctx,
+        )
+        self._ctx_menu.allowed_installs = app_commands.AppInstallationType(guild=True, user=True)
+        self._ctx_menu.allowed_contexts = app_commands.AppCommandContext(
+            guild=True, dm_channel=True, private_channel=True
+        )
+        self.bot.tree.add_command(self._ctx_menu)
+
+    async def cog_unload(self):
+        self.bot.tree.remove_command(self._ctx_menu.name, type=self._ctx_menu.type)
+
+    @app_commands.command(name="archive", description="Download, convert, and archive a GIF or image to your private server.")
+    @app_commands.describe(
+        name="A short name for this GIF (e.g. 'why is he lying')",
+        link="The Tenor, Giphy, or Discord CDN link to archive",
+        image="Upload an image to convert and archive",
+    )
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def archive_command(self, interaction: discord.Interaction, name: str, link: str = None, image: discord.Attachment = None):
+        await interaction.response.defer(ephemeral=True)
+
+        async def safe_reply(content: str = None, **kwargs):
+            try:
+                if not interaction.is_expired():
+                    await interaction.followup.send(content, **kwargs)
+                else:
+                    await interaction.user.send(content, **kwargs)
+            except discord.errors.NotFound:
+                try:
+                    await interaction.user.send(content, **kwargs)
+                except discord.errors.Forbidden:
+                    pass
+            except Exception:
+                pass
+
+        if bool(link) == bool(image):
+            await safe_reply("❌ Please provide exactly **one** option: either a `link` or an `image`.")
+            return
+
+        try:
+            upload_filename = InputValidator.validate_name(name)
+            if link:
+                link = InputValidator.validate_link(link)
+            if image:
+                InputValidator.validate_image(image)
+        except ValueError as e:
+            await safe_reply(f"❌ {e}")
+            return
+
+        await self.bot.do_archive(
+            interaction,
+            link=link,
+            image=image,
+            upload_filename=upload_filename,
+            safe_reply=safe_reply,
+        )
+
+    async def _archive_message_ctx(self, interaction: discord.Interaction, message: discord.Message):
+        result = extract_media_from_message(message)
+        if result is None:
+            await interaction.response.send_message(
+                "❌ No supported image or GIF found in this message.",
+                ephemeral=True,
+            )
+            return
+
+        source_url, _ = result
+        modal = GifNameModal(self.bot, source_url)
+        await interaction.response.send_modal(modal)
+
+    @app_commands.command(name="invite", description="Get the link to add this bot to your Discord account or server.")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def invite_command(self, interaction: discord.Interaction):
+        client_id = self.bot.application_id
+        if not client_id:
+            await interaction.response.send_message(
+                "❌ Application ID not available yet — try again in a moment.", ephemeral=True
+            )
+            return
+
+        user_url = (
+            f"https://discord.com/oauth2/authorize"
+            f"?client_id={client_id}&integration_type=1&scope=applications.commands"
+        )
+        guild_url = (
+            f"https://discord.com/oauth2/authorize"
+            f"?client_id={client_id}&scope=bot+applications.commands&permissions=51200"
+        )
+
+        embed = discord.Embed(
+            title="📎 Add GIF Archiver",
+            description=(
+                "**Personal (User Install)**\n"
+                "Use the bot anywhere on Discord — no server needed.\n"
+                f"[➕ Add to My Account]({user_url})\n\n"
+                "**Server Install**\n"
+                "Add the bot to a server so all members can use it.\n"
+                f"[➕ Add to Server]({guild_url})"
+            ),
+            color=0x5865F2,
+        )
+        embed.set_footer(text="After adding: right-click any image/GIF → Apps → Archive as GIF")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
     @app_commands.command(name="search", description="Search your GIF archive by filename.")
     @app_commands.describe(query="Search term to match against GIF filenames")
     @app_commands.allowed_installs(guilds=True, users=True)
@@ -610,7 +771,6 @@ class ArchiveCog(commands.Cog):
     async def search_command(self, interaction: discord.Interaction, query: str):
         await interaction.response.defer(ephemeral=True)
 
-        # --- Input validation ---
         try:
             query = InputValidator.validate_query(query)
         except ValueError as e:
